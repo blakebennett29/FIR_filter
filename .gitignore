@@ -1,0 +1,32 @@
+# ---- Vivado generated / junk ----
+.Xil/
+*.jou
+*.log
+*.str
+*.tmp
+*.wdb
+*.wcfg
+*.pb
+*.zip
+
+# output + runs
+*.runs/
+*.cache/
+*.sim/
+*.hw/
+*.ip_user_files/
+*.srcs/sources_1/ip/*/.Xil/
+
+# reports / misc
+webtalk/
+webtalk.log
+webtalk.jou
+usage_statistics_webtalk.html
+usage_statistics_webtalk.xml
+hs_err_pid*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
