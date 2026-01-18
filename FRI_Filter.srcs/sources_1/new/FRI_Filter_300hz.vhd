@@ -55,7 +55,7 @@ architecture Behavioral of TOP is
 --            m_axis_data_tdata   : out std_logic_vector(23 downto 0)
 --        );
 --    end component;
-
+ 
     -- 3) I2S receiver
     component i2s_receiver_inputs is
         port (
