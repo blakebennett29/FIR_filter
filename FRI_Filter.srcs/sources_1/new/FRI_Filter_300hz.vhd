@@ -2,61 +2,38 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
--- Top-level entity (rename ports to match your board pins)
 entity TOP is
     port (
-        -- system input clock & reset
-        clk_in      : in  std_logic; --100mhz
-        resetn_in   : in  std_logic; --u18 button
+        clk_in      : in  std_logic; -- 100 MHz
+        resetn_in   : in  std_logic; -- active-low reset button
 
-        -- audio master clock from codec / clocking
-        --aud_mclk    : in  std_logic; --24.573
+        -- ADC SDOUT from Pmod (pin 10)
+        i2s_rx_sdata : in  std_logic;
 
-        -- I2S pins to/from codec (just to keep things from being optimized away)
-        i2s_rx_sdata : in  std_logic; --channels 1,2
-        i2s_rx_lrclk : out std_logic; --determended by i2s core
-        i2s_rx_sclk  : out std_logic; --bit clock determended by i2s core
-        i2s_rx_mclk  : out  std_logic; -- 24.576Mhz clk
-        
-        i2s_tx_sdata : out std_logic; --to out data pin on pmod
-        i2s_tx_lrclk : out std_logic; --to lrclk pin on pmod
-        i2s_tx_sclk  : out std_logic;  --to bit clk pin on pmod
-        i2s_tx_mclk  : out  std_logic -- 24.576Mhz clk
+        -- ADC clocks to Pmod (pins 7/8/9)
+        i2s_rx_lrclk : out std_logic;
+        i2s_rx_sclk  : out std_logic;
+        i2s_rx_mclk  : out std_logic;
+
+        -- DAC signals to Pmod (pins 1/2/3/4)
+        i2s_tx_sdata : out std_logic;
+        i2s_tx_lrclk : out std_logic;
+        i2s_tx_sclk  : out std_logic;
+        i2s_tx_mclk  : out std_logic
     );
-end entity TOP;
+end entity;
 
 architecture Behavioral of TOP is
 
-    --------------------------------------------------------------------
-    -- COMPONENT DECLARATIONS (match IP port lists)
-    --------------------------------------------------------------------
-
-    -- 1) Clock wizard (3 outputs as in the Verilog)
     component clk_wiz_0 is
         port (
-            clk_out1 : out std_logic; --24.57 mzh for pmod testing
+            clk_out1 : out std_logic; -- 24.576 MHz
             reset    : in  std_logic;
             locked   : out std_logic;
-            clk_in1  : in  std_logic --100mhz source clk
+            clk_in1  : in  std_logic
         );
     end component;
 
---    -- 2) FIR compiler (24-bit data, no m_axis_data_tready)
---    component fir_compiler_0 is
---        port (
---            aclk                : in  std_logic;
---            s_axis_data_tvalid  : in  std_logic;
---            s_axis_data_tready  : out std_logic;
---            s_axis_data_tdata   : in  std_logic_vector(23 downto 0);
---            s_axis_config_tvalid: in  std_logic;
---            s_axis_config_tready: out std_logic;
---            s_axis_config_tdata : in  std_logic_vector(7 downto 0);
---            m_axis_data_tvalid  : out std_logic;
---            m_axis_data_tdata   : out std_logic_vector(23 downto 0)
---        );
---    end component;
- 
-    -- 3) I2S receiver
     component i2s_receiver_inputs is
         port (
             s_axi_ctrl_aclk    : in  std_logic;
@@ -101,7 +78,6 @@ architecture Behavioral of TOP is
         );
     end component;
 
-    -- 4) I2S transmitter
     component i2s_transmitter_0 is
         port (
             s_axi_ctrl_aclk    : in  std_logic;
@@ -146,191 +122,302 @@ architecture Behavioral of TOP is
         );
     end component;
 
-    --------------------------------------------------------------------
-    -- SIGNALS 
-    --------------------------------------------------------------------
-    signal clk_1_sys    : std_logic; --24.576 mhz clk
-    signal clk_locked   : std_logic; --clk wizard
-    signal rst_sys_n    : std_logic;
-    signal rst_sys_not  : std_logic;
+    -- Clocks / resets
+    signal clk_mclk    : std_logic;
+    signal clk_locked  : std_logic;
 
-    -- AXIS stream (32-bit from/to I2S)
+    signal rstn_all     : std_logic;  -- active-low, gated with lock
+    signal aud_mrst     : std_logic;  -- active-high, gated with lock
+    signal not_reset    : std_logic;
+    -- Shared I2S clocks actually driven to the Pmod
+    signal bus_lrclk    : std_logic;
+    signal bus_sclk     : std_logic;
+
+    -- AXIS loopback
     signal rx_tdata     : std_logic_vector(31 downto 0);
     signal rx_tvalid    : std_logic;
     signal rx_tready    : std_logic;
+    signal rx_tid_dummy : std_logic_vector(2 downto 0);
 
-    signal tx_tdata     : std_logic_vector(31 downto 0);
-    signal tx_tvalid    : std_logic;
-    -- tx_tready is not needed as a signal; we'll leave it open
+    signal tx_tid_const : std_logic_vector(2 downto 0) := (others => '0');
 
-    -- FIR side (24-bit)
-    signal fir_in_tdata   : std_logic_vector(23 downto 0);
-    signal fir_in_tvalid  : std_logic;
-    signal fir_in_tready  : std_logic;
-    signal fir_out_tdata  : std_logic_vector(23 downto 0);
-    signal fir_out_tvalid : std_logic;
+    -- ----------------------------
+    -- AXI-Lite init (TX)
+    -- ----------------------------
+    signal tx_awvalid, tx_wvalid : std_logic;
+    signal tx_awready, tx_wready : std_logic;
+    signal tx_bvalid             : std_logic;
+    signal tx_bready             : std_logic := '1';
+    signal tx_awaddr             : std_logic_vector(7 downto 0);
+    signal tx_wdata              : std_logic_vector(31 downto 0);
+    signal tx_bresp              : std_logic_vector(1 downto 0);
 
-    -- dummy for tids
-    signal rx_tid_dummy   : std_logic_vector(2 downto 0);
-    signal tx_tid_const   : std_logic_vector(2 downto 0) := (others => '0');
+    -- Reads unused
+    signal tx_arvalid, tx_rready : std_logic := '0';
+    signal tx_arready, tx_rvalid : std_logic;
+    signal tx_araddr             : std_logic_vector(7 downto 0) := (others => '0');
+    signal tx_rdata              : std_logic_vector(31 downto 0);
+    signal tx_rresp              : std_logic_vector(1 downto 0);
 
-    -- shared i2s signials for pmod
-    signal i2s_lrclk : std_logic;
-    signal i2s_sclk  : std_logic;
-    signal i2s_sdin  : std_logic;  -- into DAC
-    signal i2s_sdout : std_logic;  -- from ADC
-    
+    -- ----------------------------
+    -- AXI-Lite init (RX)
+    -- ----------------------------
+    signal rx_awvalid_i, rx_wvalid_i : std_logic;
+    signal rx_awready_i, rx_wready_i : std_logic;
+    signal rx_bvalid_i               : std_logic;
+    signal rx_bready_i               : std_logic := '1';
+    signal rx_awaddr_i               : std_logic_vector(7 downto 0);
+    signal rx_wdata_i                : std_logic_vector(31 downto 0);
+    signal rx_bresp_i                : std_logic_vector(1 downto 0);
+
+    signal rx_arvalid_i, rx_rready_i : std_logic := '0';
+    signal rx_arready_i, rx_rvalid_i : std_logic;
+    signal rx_araddr_i               : std_logic_vector(7 downto 0) := (others => '0');
+    signal rx_rdata_i                : std_logic_vector(31 downto 0);
+    signal rx_rresp_i                : std_logic_vector(1 downto 0);
+
+    -- Divider for Fs = 48k when MCLK = 24.576 MHz and 64*Fs bitclock
+    constant DIVIDER_48K : std_logic_vector(7 downto 0) := x"02";
+
+    constant REG_CTRL    : std_logic_vector(7 downto 0) := x"08";
+    constant REG_TIMING  : std_logic_vector(7 downto 0) := x"20";
+    constant W_ENABLE    : std_logic_vector(31 downto 0) := x"00000001";
+
+    type axi_init_state_t is (S_IDLE, S_WR_TIMING, S_WAIT_B1, S_WR_CTRL, S_WAIT_B2, S_DONE);
+    signal st_tx, st_rx : axi_init_state_t := S_IDLE;
+
 begin
-    -- MCLK goes to both codecs
-    i2s_rx_mclk <= clk_1_sys;
-    i2s_tx_mclk <= clk_1_sys;
-    
-    -- ONE set of LRCLK/SCLK drives both codecs
-    i2s_tx_lrclk <= i2s_lrclk;
-    i2s_rx_lrclk <= i2s_lrclk;
-    
-    i2s_tx_sclk <= i2s_sclk;
-    i2s_rx_sclk <= i2s_sclk;
-    
-    -- Data directions
-    i2s_tx_sdata <= i2s_sdin;
-    i2s_sdout <= i2s_rx_sdata;
 
-    rst_sys_n   <= resetn_in;
-    rst_sys_not <= not resetn_in;
 
-    ----------------------------------------------------------------
-    -- 1) Clock wizard instance
-    ----------------------------------------------------------------
+    -- Gate resets with lock so counters start together
+    rstn_all <= resetn_in and clk_locked;   -- active-low to AXI/AXIS resets
+    aud_mrst <= (not resetn_in) or (not clk_locked); -- active-high audio reset
+    not_reset <= not resetn_in;
+    -- Drive MCLK to both Pmod clock pins
+    i2s_tx_mclk <= clk_mclk;  -- Pmod pin1 (DAC MCLK)
+    i2s_rx_mclk <= clk_mclk;  -- Pmod pin7 (ADC MCLK)
+
+    -- Drive *one* set of bus clocks to BOTH DAC and ADC pins
+    i2s_tx_lrclk <= bus_lrclk; -- Pmod pin2
+    i2s_tx_sclk  <= bus_sclk;  -- Pmod pin3
+    i2s_rx_lrclk <= bus_lrclk; -- Pmod pin8
+    i2s_rx_sclk  <= bus_sclk;  -- Pmod pin9
+
+
+    -- Clock wizard makes MCLK
     u_clk_wiz : clk_wiz_0
         port map (
-            clk_out1 => clk_1_sys,       --clk_1_sys is the 24.576
-            reset    => rst_sys_not,
+            clk_out1 => clk_mclk,
+            reset    => not_reset,
             locked   => clk_locked,
-            clk_in1  => clk_in            --clk_in is the 100mhz clk
+            clk_in1  => clk_in
         );
+    -- ----------------------------
+    -- AXI-Lite init FSM for TX core
+    -- Writes:
+    --  0x20[7:0] = divider
+    --  0x08[0]   = enable
+    -- ----------------------------
+    process(clk_in)
+    begin
+        if rising_edge(clk_in) then
+            if rstn_all = '0' then
+                st_tx     <= S_IDLE;
+                tx_awvalid <= '0';
+                tx_wvalid  <= '0';
+                tx_awaddr  <= (others => '0');
+                tx_wdata   <= (others => '0');
+            else
+                case st_tx is
+                    when S_IDLE =>
+                        st_tx <= S_WR_TIMING;
 
-    ----------------------------------------------------------------
-    -- 2) I2S receiver instance
-    ----------------------------------------------------------------
+                    when S_WR_TIMING =>
+                        tx_awaddr  <= REG_TIMING;
+                        tx_wdata   <= x"000000" & DIVIDER_48K;
+                        tx_awvalid <= '1';
+                        tx_wvalid  <= '1';
+                        if (tx_awready = '1') and (tx_wready = '1') then
+                            tx_awvalid <= '0';
+                            tx_wvalid  <= '0';
+                            st_tx <= S_WAIT_B1;
+                        end if;
+
+                    when S_WAIT_B1 =>
+                        if tx_bvalid = '1' then
+                            st_tx <= S_WR_CTRL;
+                        end if;
+
+                    when S_WR_CTRL =>
+                        tx_awaddr  <= REG_CTRL;
+                        tx_wdata   <= W_ENABLE;
+                        tx_awvalid <= '1';
+                        tx_wvalid  <= '1';
+                        if (tx_awready = '1') and (tx_wready = '1') then
+                            tx_awvalid <= '0';
+                            tx_wvalid  <= '0';
+                            st_tx <= S_WAIT_B2;
+                        end if;
+
+                    when S_WAIT_B2 =>
+                        if tx_bvalid = '1' then
+                            st_tx <= S_DONE;
+                        end if;
+
+                    when others =>
+                        st_tx <= S_DONE;
+                end case;
+            end if;
+        end if;
+    end process;
+
+    -- ----------------------------
+    -- AXI-Lite init FSM for RX core (same writes)
+    -- ----------------------------
+    process(clk_in)
+    begin
+        if rising_edge(clk_in) then
+            if rstn_all = '0' then
+                st_rx       <= S_IDLE;
+                rx_awvalid_i <= '0';
+                rx_wvalid_i  <= '0';
+                rx_awaddr_i  <= (others => '0');
+                rx_wdata_i   <= (others => '0');
+            else
+                case st_rx is
+                    when S_IDLE =>
+                        st_rx <= S_WR_TIMING;
+
+                    when S_WR_TIMING =>
+                        rx_awaddr_i  <= REG_TIMING;
+                        rx_wdata_i   <= x"000000" & DIVIDER_48K;
+                        rx_awvalid_i <= '1';
+                        rx_wvalid_i  <= '1';
+                        if (rx_awready_i = '1') and (rx_wready_i = '1') then
+                            rx_awvalid_i <= '0';
+                            rx_wvalid_i  <= '0';
+                            st_rx <= S_WAIT_B1;
+                        end if;
+
+                    when S_WAIT_B1 =>
+                        if rx_bvalid_i = '1' then
+                            st_rx <= S_WR_CTRL;
+                        end if;
+
+                    when S_WR_CTRL =>
+                        rx_awaddr_i  <= REG_CTRL;
+                        rx_wdata_i   <= W_ENABLE;
+                        rx_awvalid_i <= '1';
+                        rx_wvalid_i  <= '1';
+                        if (rx_awready_i = '1') and (rx_wready_i = '1') then
+                            rx_awvalid_i <= '0';
+                            rx_wvalid_i  <= '0';
+                            st_rx <= S_WAIT_B2;
+                        end if;
+
+                    when S_WAIT_B2 =>
+                        if rx_bvalid_i = '1' then
+                            st_rx <= S_DONE;
+                        end if;
+
+                    when others =>
+                        st_rx <= S_DONE;
+                end case;
+            end if;
+        end if;
+    end process;
+
+    -- ----------------------------
+    -- RX core instance
+    -- ----------------------------
     u_i2s_rx : i2s_receiver_inputs
         port map (
             s_axi_ctrl_aclk    => clk_in,
-            s_axi_ctrl_aresetn => rst_sys_n,
-            aud_mclk           => clk_1_sys,
-            aud_mrst           => rst_sys_not,
+            s_axi_ctrl_aresetn => rstn_all,
+            aud_mclk           => clk_mclk,
+            aud_mrst           => aud_mrst,
             m_axis_aud_aclk    => clk_in,
-            m_axis_aud_aresetn => rst_sys_n,
+            m_axis_aud_aresetn => rstn_all,
 
-            -- AXI-Lite tied off
-            s_axi_ctrl_awvalid => '0',
-            s_axi_ctrl_awready => open,
-            s_axi_ctrl_awaddr  => (others => '0'),
+            s_axi_ctrl_awvalid => rx_awvalid_i,
+            s_axi_ctrl_awready => rx_awready_i,
+            s_axi_ctrl_awaddr  => rx_awaddr_i,
 
-            s_axi_ctrl_wvalid  => '0',
-            s_axi_ctrl_wready  => open,
-            s_axi_ctrl_wdata   => (others => '0'),
+            s_axi_ctrl_wvalid  => rx_wvalid_i,
+            s_axi_ctrl_wready  => rx_wready_i,
+            s_axi_ctrl_wdata   => rx_wdata_i,
 
-            s_axi_ctrl_bvalid  => open,
-            s_axi_ctrl_bready  => '0',
-            s_axi_ctrl_bresp   => open,
+            s_axi_ctrl_bvalid  => rx_bvalid_i,
+            s_axi_ctrl_bready  => rx_bready_i,
+            s_axi_ctrl_bresp   => rx_bresp_i,
 
-            s_axi_ctrl_arvalid => '0',
-            s_axi_ctrl_arready => open,
-            s_axi_ctrl_araddr  => (others => '0'),
+            s_axi_ctrl_arvalid => rx_arvalid_i,
+            s_axi_ctrl_arready => rx_arready_i,
+            s_axi_ctrl_araddr  => rx_araddr_i,
 
-            s_axi_ctrl_rvalid  => open,
-            s_axi_ctrl_rready  => '0',
-            s_axi_ctrl_rdata   => open,
-            s_axi_ctrl_rresp   => open,
+            s_axi_ctrl_rvalid  => rx_rvalid_i,
+            s_axi_ctrl_rready  => rx_rready_i,
+            s_axi_ctrl_rdata   => rx_rdata_i,
+            s_axi_ctrl_rresp   => rx_rresp_i,
 
             irq                => open,
 
-            -- I2S pins
+            -- RX-generated clocks are NOT used to drive pins (TX drives bus clocks).
+            -- They should still match if divider/reset are aligned.
             lrclk_out          => open,
             sclk_out           => open,
-            sdata_0_in         => i2s_sdout,
+            sdata_0_in         => i2s_rx_sdata, -- ADC SDOUT from Pmod pin10
             sdata_1_in         => '0',
 
-            -- AXIS audio out
-            m_axis_aud_tdata   => rx_tdata, --[27:4] actuall sample bits
-            m_axis_aud_tid     => rx_tid_dummy, --lines for mux select not routed right now
+            m_axis_aud_tdata   => rx_tdata,
+            m_axis_aud_tid     => rx_tid_dummy,
             m_axis_aud_tvalid  => rx_tvalid,
             m_axis_aud_tready  => rx_tready
         );
 
-    ----------------------------------------------------------------
-    -- 3) FIR compiler instance
-    ----------------------------------------------------------------
-
-    -- Simple wiring: 32 -> 24 bits into FIR (drop lowest 8 bits)
-    --fir_in_tdata  <= rx_tdata(31 downto 8);
-    --fir_in_tvalid <= rx_tvalid;
-    --rx_tready     <= fir_in_tready;
-
---    u_fir : fir_compiler_0
---        port map (
---            aclk                => clk_sys,
---            s_axis_data_tvalid  => fir_in_tvalid,
---            s_axis_data_tready  => fir_in_tready,
---            s_axis_data_tdata   => fir_in_tdata,
---            s_axis_config_tvalid=> '0',
---            s_axis_config_tready=> open,
---            s_axis_config_tdata => (others => '0'),
---            m_axis_data_tvalid  => fir_out_tvalid,
---            m_axis_data_tdata   => fir_out_tdata
---        );
- 
-    ----------------------------------------------------------------
-    -- 4) I2S transmitter instance
-    ----------------------------------------------------------------
-
-    -- 24 -> 32 bits for I2S (simple zero-extend)
-    tx_tdata  <= (7 downto 0 => '0') & fir_out_tdata;
-    tx_tvalid <= fir_out_tvalid;
-
+    -- ----------------------------
+    -- TX core instance (drives the *bus* clocks and DAC SDIN)
+    -- Loopback: rx_tdata/rx_tvalid go straight into TX
+    -- ----------------------------
     u_i2s_tx : i2s_transmitter_0
         port map (
             s_axi_ctrl_aclk    => clk_in,
-            s_axi_ctrl_aresetn => rst_sys_n,
-            aud_mclk           => clk_1_sys,
-            aud_mrst           => rst_sys_not,
+            s_axi_ctrl_aresetn => rstn_all,
+            aud_mclk           => clk_mclk,
+            aud_mrst           => aud_mrst,
             s_axis_aud_aclk    => clk_in,
-            s_axis_aud_aresetn => rst_sys_n,
+            s_axis_aud_aresetn => rstn_all,
 
-            -- AXI-Lite tied off
-            s_axi_ctrl_awvalid => '0',
-            s_axi_ctrl_awready => open,
-            s_axi_ctrl_awaddr  => (others => '0'),
+            s_axi_ctrl_awvalid => tx_awvalid,
+            s_axi_ctrl_awready => tx_awready,
+            s_axi_ctrl_awaddr  => tx_awaddr,
 
-            s_axi_ctrl_wvalid  => '0',
-            s_axi_ctrl_wready  => open,
-            s_axi_ctrl_wdata   => (others => '0'),
+            s_axi_ctrl_wvalid  => tx_wvalid,
+            s_axi_ctrl_wready  => tx_wready,
+            s_axi_ctrl_wdata   => tx_wdata,
 
-            s_axi_ctrl_bvalid  => open,
-            s_axi_ctrl_bready  => '0',
-            s_axi_ctrl_bresp   => open,
+            s_axi_ctrl_bvalid  => tx_bvalid,
+            s_axi_ctrl_bready  => tx_bready,
+            s_axi_ctrl_bresp   => tx_bresp,
 
-            s_axi_ctrl_arvalid => '0',
-            s_axi_ctrl_arready => open,
-            s_axi_ctrl_araddr  => (others => '0'),
+            s_axi_ctrl_arvalid => tx_arvalid,
+            s_axi_ctrl_arready => tx_arready,
+            s_axi_ctrl_araddr  => tx_araddr,
 
-            s_axi_ctrl_rvalid  => open,
-            s_axi_ctrl_rready  => '0',
-            s_axi_ctrl_rdata   => open,
-            s_axi_ctrl_rresp   => open,
+            s_axi_ctrl_rvalid  => tx_rvalid,
+            s_axi_ctrl_rready  => tx_rready,
+            s_axi_ctrl_rdata   => tx_rdata,
+            s_axi_ctrl_rresp   => tx_rresp,
 
             irq                => open,
 
-            -- I2S pins
-            lrclk_out          => i2s_tx_lrclk, 
-            sclk_out           => i2s_tx_sclk, -- bit clock
-            sdata_0_out        => i2s_tx_sdata, -- data streams 1,2
+            lrclk_out          => bus_lrclk,
+            sclk_out           => bus_sclk,
+            sdata_0_out        => i2s_tx_sdata, -- DAC SDIN to Pmod pin4
             sdata_1_out        => open,
 
-            -- AXIS audio in
-            s_axis_aud_tdata   => rx_tdata, --input data
-            s_axis_aud_tid     => tx_tid_const, -- not implemented used for mux select
+            s_axis_aud_tdata   => rx_tdata,
+            s_axis_aud_tid     => tx_tid_const,
             s_axis_aud_tvalid  => rx_tvalid,
             s_axis_aud_tready  => rx_tready
         );
