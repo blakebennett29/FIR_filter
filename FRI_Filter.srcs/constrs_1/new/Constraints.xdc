@@ -1,6 +1,10 @@
 set_property IOSTANDARD LVCMOS33 [get_ports resetn_in]
 set_property PACKAGE_PIN U18 [get_ports resetn_in]
 set_property PACKAGE_PIN W5 [get_ports clk_in]
+
+create_clock -name clk100 -period 10.000 [get_ports clk_in]
+
+
 set_property IOSTANDARD LVCMOS33 [get_ports clk_in]
 set_property IOSTANDARD LVCMOS33 [get_ports i2s_rx_lrclk]
 set_property IOSTANDARD LVCMOS33 [get_ports i2s_rx_sclk]

@@ -223,6 +223,9 @@
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
+        <CompFileExtendedInfo CompFileName="clk_wiz_0.xci" FileRelPathName="e:/School/SeniorProject/FRI_Filter/FRI_Filter.gen/sources_1/ip/clk_wiz_0/clk_wiz_0.xdc">
+          <Attr Name="UserDisabled" Val="1"/>
+        </CompFileExtendedInfo>
       </File>
       <Config>
         <Option Name="TopModule" Val="clk_wiz_0"/>

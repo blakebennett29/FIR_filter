@@ -25,10 +25,13 @@ end entity;
 
 architecture Behavioral of TOP is
 
+    --------------------------------------------------------------------
+    -- COMPONENTS
+    --------------------------------------------------------------------
     component clk_wiz_0 is
         port (
             clk_out1 : out std_logic; -- 24.576 MHz
-            reset    : in  std_logic;
+            reset    : in  std_logic; -- active-high reset
             locked   : out std_logic;
             clk_in1  : in  std_logic
         );
@@ -122,18 +125,41 @@ architecture Behavioral of TOP is
         );
     end component;
 
-    -- Clocks / resets
+    --------------------------------------------------------------------
+    -- CLOCKS
+    --------------------------------------------------------------------
     signal clk_mclk    : std_logic;
     signal clk_locked  : std_logic;
 
-    signal rstn_all     : std_logic;  -- active-low, gated with lock
-    signal aud_mrst     : std_logic;  -- active-high, gated with lock
-    signal not_reset    : std_logic;
-    -- Shared I2S clocks actually driven to the Pmod
+    -- Clock wizard reset (active-high)
+    signal not_reset   : std_logic;
+
+    --------------------------------------------------------------------
+    -- RESET (clean + synchronized)
+    --------------------------------------------------------------------
+    signal rst_async      : std_logic;  -- active-high async reset source (btn OR !locked)
+
+    -- clk_in domain
+    signal rst_sync0_sys  : std_logic := '1';
+    signal rst_sync1_sys  : std_logic := '1';
+    signal rst_sys        : std_logic;  -- active-high sync reset
+    signal rstn_sys       : std_logic;  -- active-low reset for AXI aresetn
+
+    -- clk_mclk domain
+    signal rst_sync0_mclk : std_logic := '1';
+    signal rst_sync1_mclk : std_logic := '1';
+    signal rst_mclk       : std_logic;  -- active-high sync reset (audio reset)
+    signal rstn_mclk      : std_logic;  -- active-low version if needed later
+
+    --------------------------------------------------------------------
+    -- I2S bus clocks to Pmod (driven by TX core)
+    --------------------------------------------------------------------
     signal bus_lrclk    : std_logic;
     signal bus_sclk     : std_logic;
 
+    --------------------------------------------------------------------
     -- AXIS loopback
+    --------------------------------------------------------------------
     signal rx_tdata     : std_logic_vector(31 downto 0);
     signal rx_tvalid    : std_logic;
     signal rx_tready    : std_logic;
@@ -141,9 +167,9 @@ architecture Behavioral of TOP is
 
     signal tx_tid_const : std_logic_vector(2 downto 0) := (others => '0');
 
-    -- ----------------------------
+    --------------------------------------------------------------------
     -- AXI-Lite init (TX)
-    -- ----------------------------
+    --------------------------------------------------------------------
     signal tx_awvalid, tx_wvalid : std_logic;
     signal tx_awready, tx_wready : std_logic;
     signal tx_bvalid             : std_logic;
@@ -159,9 +185,9 @@ architecture Behavioral of TOP is
     signal tx_rdata              : std_logic_vector(31 downto 0);
     signal tx_rresp              : std_logic_vector(1 downto 0);
 
-    -- ----------------------------
+    --------------------------------------------------------------------
     -- AXI-Lite init (RX)
-    -- ----------------------------
+    --------------------------------------------------------------------
     signal rx_awvalid_i, rx_wvalid_i : std_logic;
     signal rx_awready_i, rx_wready_i : std_logic;
     signal rx_bvalid_i               : std_logic;
@@ -176,8 +202,14 @@ architecture Behavioral of TOP is
     signal rx_rdata_i                : std_logic_vector(31 downto 0);
     signal rx_rresp_i                : std_logic_vector(1 downto 0);
 
-    -- Divider for Fs = 48k when MCLK = 24.576 MHz and 64*Fs bitclock
-    constant DIVIDER_48K : std_logic_vector(7 downto 0) := x"02";
+    --------------------------------------------------------------------
+    -- Registers / constants
+    --------------------------------------------------------------------
+    -- For Fs = 96 kHz when MCLK = 24.576 MHz and 64*Fs bitclock:
+    --   SCLK = 64*Fs = 6.144 MHz
+    --   MCLK/SCLK = 4
+    --   divider = 2 (since MCLK/SCLK = divider*2)
+    constant DIVIDER_96KHZ : std_logic_vector(7 downto 0) := x"02";
 
     constant REG_CTRL    : std_logic_vector(7 downto 0) := x"08";
     constant REG_TIMING  : std_logic_vector(7 downto 0) := x"20";
@@ -187,42 +219,78 @@ architecture Behavioral of TOP is
     signal st_tx, st_rx : axi_init_state_t := S_IDLE;
 
 begin
-
-
-    -- Gate resets with lock so counters start together
-    rstn_all <= resetn_in and clk_locked;   -- active-low to AXI/AXIS resets
-    aud_mrst <= (not resetn_in) or (not clk_locked); -- active-high audio reset
+    --------------------------------------------------------------------
+    -- Clock wizard reset + async reset source
+    --------------------------------------------------------------------
     not_reset <= not resetn_in;
+
+    -- one simple async reset source used only for synchronizers
+    rst_async <= (not resetn_in) or (not clk_locked);
+
+    --------------------------------------------------------------------
+    -- Clock wizard makes MCLK
+    --------------------------------------------------------------------
+    u_clk_wiz : clk_wiz_0
+        port map (
+            clk_out1 => clk_mclk,
+            reset    => not_reset,     -- active-high reset
+            locked   => clk_locked,
+            clk_in1  => clk_in
+        );
+
+    --------------------------------------------------------------------
+    -- Synchronize reset into clk_in domain (100 MHz)
+    --------------------------------------------------------------------
+    process(clk_in)
+    begin
+        if rising_edge(clk_in) then
+            rst_sync0_sys <= rst_async;
+            rst_sync1_sys <= rst_sync0_sys;
+        end if;
+    end process;
+
+    rst_sys  <= rst_sync1_sys;  -- active-high
+    rstn_sys <= not rst_sys;     -- active-low for AXI resets
+
+    --------------------------------------------------------------------
+    -- Synchronize reset into clk_mclk domain (24.576 MHz)
+    --------------------------------------------------------------------
+    process(clk_mclk)
+    begin
+        if rising_edge(clk_mclk) then
+            rst_sync0_mclk <= rst_async;
+            rst_sync1_mclk <= rst_sync0_mclk;
+        end if;
+    end process;
+
+    rst_mclk  <= rst_sync1_mclk; -- active-high, use for aud_mrst
+    rstn_mclk <= not rst_mclk;
+
+    --------------------------------------------------------------------
     -- Drive MCLK to both Pmod clock pins
+    --------------------------------------------------------------------
     i2s_tx_mclk <= clk_mclk;  -- Pmod pin1 (DAC MCLK)
     i2s_rx_mclk <= clk_mclk;  -- Pmod pin7 (ADC MCLK)
 
+    --------------------------------------------------------------------
     -- Drive *one* set of bus clocks to BOTH DAC and ADC pins
+    --------------------------------------------------------------------
     i2s_tx_lrclk <= bus_lrclk; -- Pmod pin2
     i2s_tx_sclk  <= bus_sclk;  -- Pmod pin3
     i2s_rx_lrclk <= bus_lrclk; -- Pmod pin8
     i2s_rx_sclk  <= bus_sclk;  -- Pmod pin9
 
-
-    -- Clock wizard makes MCLK
-    u_clk_wiz : clk_wiz_0
-        port map (
-            clk_out1 => clk_mclk,
-            reset    => not_reset,
-            locked   => clk_locked,
-            clk_in1  => clk_in
-        );
-    -- ----------------------------
+    --------------------------------------------------------------------
     -- AXI-Lite init FSM for TX core
     -- Writes:
     --  0x20[7:0] = divider
     --  0x08[0]   = enable
-    -- ----------------------------
+    --------------------------------------------------------------------
     process(clk_in)
     begin
         if rising_edge(clk_in) then
-            if rstn_all = '0' then
-                st_tx     <= S_IDLE;
+            if rst_sys = '1' then
+                st_tx      <= S_IDLE;
                 tx_awvalid <= '0';
                 tx_wvalid  <= '0';
                 tx_awaddr  <= (others => '0');
@@ -234,7 +302,7 @@ begin
 
                     when S_WR_TIMING =>
                         tx_awaddr  <= REG_TIMING;
-                        tx_wdata   <= x"000000" & DIVIDER_48K;
+                        tx_wdata   <= x"000000" & DIVIDER_96KHZ;
                         tx_awvalid <= '1';
                         tx_wvalid  <= '1';
                         if (tx_awready = '1') and (tx_wready = '1') then
@@ -271,13 +339,13 @@ begin
         end if;
     end process;
 
-    -- ----------------------------
+    --------------------------------------------------------------------
     -- AXI-Lite init FSM for RX core (same writes)
-    -- ----------------------------
+    --------------------------------------------------------------------
     process(clk_in)
     begin
         if rising_edge(clk_in) then
-            if rstn_all = '0' then
+            if rst_sys = '1' then
                 st_rx       <= S_IDLE;
                 rx_awvalid_i <= '0';
                 rx_wvalid_i  <= '0';
@@ -290,7 +358,7 @@ begin
 
                     when S_WR_TIMING =>
                         rx_awaddr_i  <= REG_TIMING;
-                        rx_wdata_i   <= x"000000" & DIVIDER_48K;
+                        rx_wdata_i   <= x"000000" & DIVIDER_96KHZ;
                         rx_awvalid_i <= '1';
                         rx_wvalid_i  <= '1';
                         if (rx_awready_i = '1') and (rx_wready_i = '1') then
@@ -327,17 +395,17 @@ begin
         end if;
     end process;
 
-    -- ----------------------------
+    --------------------------------------------------------------------
     -- RX core instance
-    -- ----------------------------
+    --------------------------------------------------------------------
     u_i2s_rx : i2s_receiver_inputs
         port map (
             s_axi_ctrl_aclk    => clk_in,
-            s_axi_ctrl_aresetn => rstn_all,
+            s_axi_ctrl_aresetn => rstn_sys,
             aud_mclk           => clk_mclk,
-            aud_mrst           => aud_mrst,
+            aud_mrst           => rst_mclk,
             m_axis_aud_aclk    => clk_in,
-            m_axis_aud_aresetn => rstn_all,
+            m_axis_aud_aresetn => rstn_sys,
 
             s_axi_ctrl_awvalid => rx_awvalid_i,
             s_axi_ctrl_awready => rx_awready_i,
@@ -362,8 +430,6 @@ begin
 
             irq                => open,
 
-            -- RX-generated clocks are NOT used to drive pins (TX drives bus clocks).
-            -- They should still match if divider/reset are aligned.
             lrclk_out          => open,
             sclk_out           => open,
             sdata_0_in         => i2s_rx_sdata, -- ADC SDOUT from Pmod pin10
@@ -375,18 +441,18 @@ begin
             m_axis_aud_tready  => rx_tready
         );
 
-    -- ----------------------------
+    --------------------------------------------------------------------
     -- TX core instance (drives the *bus* clocks and DAC SDIN)
     -- Loopback: rx_tdata/rx_tvalid go straight into TX
-    -- ----------------------------
+    --------------------------------------------------------------------
     u_i2s_tx : i2s_transmitter_0
         port map (
             s_axi_ctrl_aclk    => clk_in,
-            s_axi_ctrl_aresetn => rstn_all,
+            s_axi_ctrl_aresetn => rstn_sys,
             aud_mclk           => clk_mclk,
-            aud_mrst           => aud_mrst,
+            aud_mrst           => rst_mclk,
             s_axis_aud_aclk    => clk_in,
-            s_axis_aud_aresetn => rstn_all,
+            s_axis_aud_aresetn => rstn_sys,
 
             s_axi_ctrl_awvalid => tx_awvalid,
             s_axi_ctrl_awready => tx_awready,
