@@ -173,7 +173,7 @@ architecture Behavioral of TOP is
     signal tx_awvalid, tx_wvalid : std_logic;
     signal tx_awready, tx_wready : std_logic;
     signal tx_bvalid             : std_logic;
-    signal tx_bready             : std_logic := '1';
+    signal tx_bready             : std_logic := '0'; -- controlled by FSM
     signal tx_awaddr             : std_logic_vector(7 downto 0);
     signal tx_wdata              : std_logic_vector(31 downto 0);
     signal tx_bresp              : std_logic_vector(1 downto 0);
@@ -191,7 +191,7 @@ architecture Behavioral of TOP is
     signal rx_awvalid_i, rx_wvalid_i : std_logic;
     signal rx_awready_i, rx_wready_i : std_logic;
     signal rx_bvalid_i               : std_logic;
-    signal rx_bready_i               : std_logic := '1';
+    signal rx_bready_i               : std_logic := '0'; -- controlled by FSM
     signal rx_awaddr_i               : std_logic_vector(7 downto 0);
     signal rx_wdata_i                : std_logic_vector(31 downto 0);
     signal rx_bresp_i                : std_logic_vector(1 downto 0);
@@ -202,6 +202,13 @@ architecture Behavioral of TOP is
     signal rx_rdata_i                : std_logic_vector(31 downto 0);
     signal rx_rresp_i                : std_logic_vector(1 downto 0);
 
+
+    -- TX write handshake trackers
+    signal tx_aw_done, tx_w_done : std_logic := '0';
+    
+    -- RX write handshake trackers
+    signal rx_aw_done, rx_w_done : std_logic := '0';
+    
     --------------------------------------------------------------------
     -- Registers / constants
     --------------------------------------------------------------------
@@ -215,7 +222,10 @@ architecture Behavioral of TOP is
     constant REG_TIMING  : std_logic_vector(7 downto 0) := x"20";
     constant W_ENABLE    : std_logic_vector(31 downto 0) := x"00000001";
 
-    type axi_init_state_t is (S_IDLE, S_WR_TIMING, S_WAIT_B1, S_WR_CTRL, S_WAIT_B2, S_DONE);
+    type axi_init_state_t is (S_IDLE,
+  S_WR_TIMING_ISSUE, S_WR_TIMING, S_WAIT_B1,
+  S_WR_CTRL_ISSUE,   S_WR_CTRL,   S_WAIT_B2,
+  S_DONE);
     signal st_tx, st_rx : axi_init_state_t := S_IDLE;
 
 begin
@@ -280,120 +290,245 @@ begin
     i2s_rx_lrclk <= bus_lrclk; -- Pmod pin8
     i2s_rx_sclk  <= bus_sclk;  -- Pmod pin9
 
-    --------------------------------------------------------------------
-    -- AXI-Lite init FSM for TX core
-    -- Writes:
-    --  0x20[7:0] = divider
-    --  0x08[0]   = enable
-    --------------------------------------------------------------------
-    process(clk_in)
-    begin
-        if rising_edge(clk_in) then
-            if rst_sys = '1' then
-                st_tx      <= S_IDLE;
-                tx_awvalid <= '0';
-                tx_wvalid  <= '0';
-                tx_awaddr  <= (others => '0');
-                tx_wdata   <= (others => '0');
-            else
-                case st_tx is
-                    when S_IDLE =>
-                        st_tx <= S_WR_TIMING;
+   ------------------------------------------------------------------------------
+-- TX AXI-Lite init FSM
+-- Writes:
+--   REG_TIMING (0x20) = divider
+--   REG_CTRL   (0x08) = enable
+--
+-- Key robustness rules:
+--  1) Hold AWVALID/WVALID high for a full cycle first (ISSUE states)
+--  2) Allow AW and W to handshake independently
+--  3) Gate BREADY: keep it 0 until we are in WAIT_B states
+--     (forces slave to hold BVALID until we are ready to accept it)
+------------------------------------------------------------------------------
+process(clk_in)
+begin
+  if rising_edge(clk_in) then
+    if rst_sys = '1' then
+      st_tx      <= S_IDLE;
 
-                    when S_WR_TIMING =>
-                        tx_awaddr  <= REG_TIMING;
-                        tx_wdata   <= x"000000" & DIVIDER_96KHZ;
-                        tx_awvalid <= '1';
-                        tx_wvalid  <= '1';
-                        if (tx_awready = '1') and (tx_wready = '1') then
-                            tx_awvalid <= '0';
-                            tx_wvalid  <= '0';
-                            st_tx <= S_WAIT_B1;
-                        end if;
+      -- AXI write address/data channels
+      tx_awvalid <= '0';
+      tx_wvalid  <= '0';
+      tx_awaddr  <= (others => '0');
+      tx_wdata   <= (others => '0');
 
-                    when S_WAIT_B1 =>
-                        if tx_bvalid = '1' then
-                            st_tx <= S_WR_CTRL;
-                        end if;
+      -- track independent handshakes
+      tx_aw_done <= '0';
+      tx_w_done  <= '0';
 
-                    when S_WR_CTRL =>
-                        tx_awaddr  <= REG_CTRL;
-                        tx_wdata   <= W_ENABLE;
-                        tx_awvalid <= '1';
-                        tx_wvalid  <= '1';
-                        if (tx_awready = '1') and (tx_wready = '1') then
-                            tx_awvalid <= '0';
-                            tx_wvalid  <= '0';
-                            st_tx <= S_WAIT_B2;
-                        end if;
+      -- IMPORTANT: keep BREADY low during reset
+      tx_bready  <= '0';
 
-                    when S_WAIT_B2 =>
-                        if tx_bvalid = '1' then
-                            st_tx <= S_DONE;
-                        end if;
+    else
+      -- DEFAULT every cycle (unless overridden in WAIT states):
+      -- do NOT accept write responses unless we are actively waiting for them
+      tx_bready <= '0';
 
-                    when others =>
-                        st_tx <= S_DONE;
-                end case;
-            end if;
-        end if;
-    end process;
+      case st_tx is
 
-    --------------------------------------------------------------------
-    -- AXI-Lite init FSM for RX core (same writes)
-    --------------------------------------------------------------------
-    process(clk_in)
-    begin
-        if rising_edge(clk_in) then
-            if rst_sys = '1' then
-                st_rx       <= S_IDLE;
-                rx_awvalid_i <= '0';
-                rx_wvalid_i  <= '0';
-                rx_awaddr_i  <= (others => '0');
-                rx_wdata_i   <= (others => '0');
-            else
-                case st_rx is
-                    when S_IDLE =>
-                        st_rx <= S_WR_TIMING;
+        when S_IDLE =>
+          -- start timing write
+          st_tx      <= S_WR_TIMING_ISSUE;
+          tx_aw_done <= '0';
+          tx_w_done  <= '0';
 
-                    when S_WR_TIMING =>
-                        rx_awaddr_i  <= REG_TIMING;
-                        rx_wdata_i   <= x"000000" & DIVIDER_96KHZ;
-                        rx_awvalid_i <= '1';
-                        rx_wvalid_i  <= '1';
-                        if (rx_awready_i = '1') and (rx_wready_i = '1') then
-                            rx_awvalid_i <= '0';
-                            rx_wvalid_i  <= '0';
-                            st_rx <= S_WAIT_B1;
-                        end if;
+        when S_WR_TIMING_ISSUE =>
+          -- Drive addr/data and assert valids for a FULL cycle
+          -- (prevents "too short" valid pulses when ready is already high)
+          tx_awaddr  <= REG_TIMING;
+          tx_wdata   <= x"000000" & DIVIDER_96KHZ;
+          tx_awvalid <= '1';
+          tx_wvalid  <= '1';
+          tx_aw_done <= '0';
+          tx_w_done  <= '0';
+          st_tx      <= S_WR_TIMING;
 
-                    when S_WAIT_B1 =>
-                        if rx_bvalid_i = '1' then
-                            st_rx <= S_WR_CTRL;
-                        end if;
+        when S_WR_TIMING =>
+          -- Handshake AW independently
+          if (tx_awvalid = '1') and (tx_awready = '1') then
+            tx_awvalid <= '0';
+            tx_aw_done <= '1';
+          end if;
 
-                    when S_WR_CTRL =>
-                        rx_awaddr_i  <= REG_CTRL;
-                        rx_wdata_i   <= W_ENABLE;
-                        rx_awvalid_i <= '1';
-                        rx_wvalid_i  <= '1';
-                        if (rx_awready_i = '1') and (rx_wready_i = '1') then
-                            rx_awvalid_i <= '0';
-                            rx_wvalid_i  <= '0';
-                            st_rx <= S_WAIT_B2;
-                        end if;
+          -- Handshake W independently
+          if (tx_wvalid = '1') and (tx_wready = '1') then
+            tx_wvalid <= '0';
+            tx_w_done <= '1';
+          end if;
 
-                    when S_WAIT_B2 =>
-                        if rx_bvalid_i = '1' then
-                            st_rx <= S_DONE;
-                        end if;
+          -- Once both channels accepted, wait for write response
+          if (tx_aw_done = '1') and (tx_w_done = '1') then
+            st_tx <= S_WAIT_B1;
+          end if;
 
-                    when others =>
-                        st_rx <= S_DONE;
-                end case;
-            end if;
-        end if;
-    end process;
+        when S_WAIT_B1 =>
+          -- ONLY here do we assert BREADY
+          -- This guarantees the slave holds BVALID until we accept it.
+          tx_bready <= '1';
+
+          if tx_bvalid = '1' then
+            -- response accepted (because BREADY=1)
+            -- move to next write
+            st_tx      <= S_WR_CTRL_ISSUE;
+            tx_aw_done <= '0';
+            tx_w_done  <= '0';
+          end if;
+
+        when S_WR_CTRL_ISSUE =>
+          -- Drive addr/data and assert valids for a FULL cycle
+          tx_awaddr  <= REG_CTRL;
+          tx_wdata   <= W_ENABLE;
+          tx_awvalid <= '1';
+          tx_wvalid  <= '1';
+          tx_aw_done <= '0';
+          tx_w_done  <= '0';
+          st_tx      <= S_WR_CTRL;
+
+        when S_WR_CTRL =>
+          if (tx_awvalid = '1') and (tx_awready = '1') then
+            tx_awvalid <= '0';
+            tx_aw_done <= '1';
+          end if;
+
+          if (tx_wvalid = '1') and (tx_wready = '1') then
+            tx_wvalid <= '0';
+            tx_w_done <= '1';
+          end if;
+
+          if (tx_aw_done = '1') and (tx_w_done = '1') then
+            st_tx <= S_WAIT_B2;
+          end if;
+
+        when S_WAIT_B2 =>
+          tx_bready <= '1';
+
+          if tx_bvalid = '1' then
+            st_tx <= S_DONE;
+          end if;
+
+        when others =>
+          st_tx <= S_DONE;
+
+      end case;
+    end if;
+  end if;
+end process;
+
+
+
+
+  ------------------------------------------------------------------------------
+-- RX AXI-Lite init FSM (same writes as TX)
+-- Writes:
+--   REG_TIMING (0x20) = divider
+--   REG_CTRL   (0x08) = enable
+--
+-- Same robustness rules as TX.
+------------------------------------------------------------------------------
+process(clk_in)
+begin
+  if rising_edge(clk_in) then
+    if rst_sys = '1' then
+      st_rx        <= S_IDLE;
+
+      rx_awvalid_i <= '0';
+      rx_wvalid_i  <= '0';
+      rx_awaddr_i  <= (others => '0');
+      rx_wdata_i   <= (others => '0');
+
+      rx_aw_done   <= '0';
+      rx_w_done    <= '0';
+
+      -- IMPORTANT: keep BREADY low during reset
+      rx_bready_i  <= '0';
+
+    else
+      -- DEFAULT: don't accept responses unless waiting
+      rx_bready_i <= '0';
+
+      case st_rx is
+
+        when S_IDLE =>
+          st_rx      <= S_WR_TIMING_ISSUE;
+          rx_aw_done <= '0';
+          rx_w_done  <= '0';
+
+        when S_WR_TIMING_ISSUE =>
+          rx_awaddr_i  <= REG_TIMING;
+          rx_wdata_i   <= x"000000" & DIVIDER_96KHZ;
+          rx_awvalid_i <= '1';
+          rx_wvalid_i  <= '1';
+          rx_aw_done   <= '0';
+          rx_w_done    <= '0';
+          st_rx        <= S_WR_TIMING;
+
+        when S_WR_TIMING =>
+          if (rx_awvalid_i = '1') and (rx_awready_i = '1') then
+            rx_awvalid_i <= '0';
+            rx_aw_done   <= '1';
+          end if;
+
+          if (rx_wvalid_i = '1') and (rx_wready_i = '1') then
+            rx_wvalid_i <= '0';
+            rx_w_done   <= '1';
+          end if;
+
+          if (rx_aw_done = '1') and (rx_w_done = '1') then
+            st_rx <= S_WAIT_B1;
+          end if;
+
+        when S_WAIT_B1 =>
+          rx_bready_i <= '1';
+
+          if rx_bvalid_i = '1' then
+            st_rx      <= S_WR_CTRL_ISSUE;
+            rx_aw_done <= '0';
+            rx_w_done  <= '0';
+          end if;
+
+        when S_WR_CTRL_ISSUE =>
+          rx_awaddr_i  <= REG_CTRL;
+          rx_wdata_i   <= W_ENABLE;
+          rx_awvalid_i <= '1';
+          rx_wvalid_i  <= '1';
+          rx_aw_done   <= '0';
+          rx_w_done    <= '0';
+          st_rx        <= S_WR_CTRL;
+
+        when S_WR_CTRL =>
+          if (rx_awvalid_i = '1') and (rx_awready_i = '1') then
+            rx_awvalid_i <= '0';
+            rx_aw_done   <= '1';
+          end if;
+
+          if (rx_wvalid_i = '1') and (rx_wready_i = '1') then
+            rx_wvalid_i <= '0';
+            rx_w_done   <= '1';
+          end if;
+
+          if (rx_aw_done = '1') and (rx_w_done = '1') then
+            st_rx <= S_WAIT_B2;
+          end if;
+
+        when S_WAIT_B2 =>
+          rx_bready_i <= '1';
+
+          if rx_bvalid_i = '1' then
+            st_rx <= S_DONE;
+          end if;
+
+        when others =>
+          st_rx <= S_DONE;
+
+      end case;
+    end if;
+  end if;
+end process;
+
+
+        
 
     --------------------------------------------------------------------
     -- RX core instance
