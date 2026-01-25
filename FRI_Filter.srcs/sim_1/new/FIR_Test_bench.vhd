@@ -1,15 +1,17 @@
--- tb_top.vhd (UPDATED)
--- Works with your updated TOP (sync resets, divider=96k, etc.)
+-- tb_top.vhd (UPDATED + FIXED)
 --
--- Fixes:
---  1) No to_hstring: includes a local to_hex() function
---  2) No reading OUT ports: stubs use internal *_r signals and assign to outputs
+-- Fixes applied:
+--  1) clk period corrected to 10 ns (100 MHz)
+--  2) RX/TX stub clocks phase-align on enable (both derived from same aud_mclk)
+--  3) RX stub captures the LAST bit correctly (no dropped LSB)
+--  4) ADC pattern updates immediately at LRCLK boundary (no 1-frame lag)
 --
 -- What to watch:
 --  - i2s_tx_mclk, i2s_tx_sclk, i2s_tx_lrclk
 --  - i2s_rx_sdata, i2s_tx_sdata
---  - adc_left/right (generated input pattern)
---  - dac_left/right (decoded DAC stream)
+--  - adc_word / adc_phase
+--  - dac_word / dac_phase
+--  - rx_tvalid/rx_tdata inside TOP if you add to wave
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -46,21 +48,24 @@ architecture sim of tb_top is
   end function;
 
   function to_hex(slv : std_logic_vector) return string is
-    constant N : natural := (slv'length + 3) / 4;  -- hex digits
+    constant N : natural := (slv'length + 3) / 4;
     variable res : string(1 to N);
     variable u   : unsigned(slv'length-1 downto 0);
     variable nib : natural;
+    variable hi  : integer;
   begin
     u := unsigned(slv);
     for i in 0 to N-1 loop
-      -- take nibble from MSB side
-      nib := to_integer(u(u'left - i*4 downto u'left - i*4 - 3));
+      hi := u'left - i*4;
+      nib := to_integer(u(hi downto hi-3));
       res(i+1) := hex_digit(nib);
     end loop;
     return res;
   end function;
 
+  ----------------------------------------------------------------------
   -- DUT ports
+  ----------------------------------------------------------------------
   signal clk_in        : std_logic := '0';
   signal resetn_in     : std_logic := '0';
 
@@ -77,32 +82,43 @@ architecture sim of tb_top is
   ----------------------------------------------------------------------
   -- Timing constants
   ----------------------------------------------------------------------
-  constant T_CLK100   : time := 50 ms;   -- 100 MHz clock period
-  constant SLOT_BITS  : integer := 32;   -- 32-bit slot
-  
-  --ADC Constants
-constant ADC_LEFT_BASE  : unsigned(31 downto 0) := unsigned'(x"A0000000");
-constant ADC_RIGHT_BASE : unsigned(31 downto 0) := unsigned'(x"50000000");
-  ----------------------------------------------------------------------
-  -- ADC model state (drives i2s_rx_sdata)
-  ----------------------------------------------------------------------
-  signal adc_left   : std_logic_vector(SLOT_BITS-1 downto 0) := (others => '0');
-  signal adc_right  : std_logic_vector(SLOT_BITS-1 downto 0) := (others => '0');
-  signal adc_shift  : std_logic_vector(SLOT_BITS-1 downto 0) := (others => '0');
-  signal adc_bitcnt : integer range 0 to SLOT_BITS := 0;
+  constant T_CLK100   : time := 10 ns;   -- FIX #1: true 100 MHz
+  constant SLOT_BITS  : integer := 32;
 
   ----------------------------------------------------------------------
-  -- DAC decode monitor (reconstruct from i2s_tx_sdata)
+  -- ADC pattern base constants
   ----------------------------------------------------------------------
-  signal dac_shift  : std_logic_vector(SLOT_BITS-1 downto 0) := (others => '0');
-  signal dac_bitcnt : integer range 0 to SLOT_BITS := 0;
-  signal dac_left   : std_logic_vector(SLOT_BITS-1 downto 0) := (others => '0');
-  signal dac_right  : std_logic_vector(SLOT_BITS-1 downto 0) := (others => '0');
+  constant ADC_LEFT_BASE  : unsigned(31 downto 0) := x"A0000000";
+  constant ADC_RIGHT_BASE : unsigned(31 downto 0) := x"50000000";
+
+  ----------------------------------------------------------------------
+  -- TB-visible word patterns (optional to watch)
+  ----------------------------------------------------------------------
+  signal adc_left   : std_logic_vector(31 downto 0) := std_logic_vector(ADC_LEFT_BASE);
+  signal adc_right  : std_logic_vector(31 downto 0) := std_logic_vector(ADC_RIGHT_BASE);
+
+  signal dac_left   : std_logic_vector(31 downto 0) := (others => '0');
+  signal dac_right  : std_logic_vector(31 downto 0) := (others => '0');
+
+  ----------------------------------------------------------------------
+  -- I2S alignment state (ADC)
+  ----------------------------------------------------------------------
+  signal adc_phase   : integer range 0 to 32 := 0;  -- 0=delay, 1..32=data
+  signal adc_word    : std_logic_vector(31 downto 0) := (others => '0');
+  signal lrclk_rx_d  : std_logic := '0';
+  signal sample_id   : unsigned(31 downto 0) := (others => '0');
+
+  ----------------------------------------------------------------------
+  -- I2S alignment state (DAC)
+  ----------------------------------------------------------------------
+  signal dac_phase  : integer range 0 to 32 := 0;
+  signal dac_word   : std_logic_vector(31 downto 0) := (others => '0');
+  signal lrclk_d    : std_logic := '0';
 
 begin
 
   ----------------------------------------------------------------------
-  -- Instantiate DUT (your updated TOP must be in work library)
+  -- Instantiate DUT (your updated TOP)
   ----------------------------------------------------------------------
   dut: entity work.TOP
     port map (
@@ -136,96 +152,98 @@ begin
 
   ----------------------------------------------------------------------
   -- ADC Model: drives SDOUT (i2s_rx_sdata)
+  -- Uses RX clocks coming out of TOP (which are shared with TX bus clocks).
   --
-  -- Assumptions (I2S typical):
-  --   - Data changes on falling edge of SCLK
-  --   - Data sampled on rising edge
-  --   - "1-bit delay": first bit after LRCLK boundary is dummy
-  --
-  -- We align the ADC model to the TX-generated clocks from DUT:
-  --   i2s_tx_lrclk, i2s_tx_sclk
+  -- FIX #4: update pattern immediately at boundary (no 1-frame lag)
   ----------------------------------------------------------------------
-  process(i2s_tx_sclk)
-    variable sample_id : unsigned(15 downto 0) := (others => '0');
+  process(i2s_rx_sclk)
+    variable bit_index : integer;
+    variable next_id   : unsigned(31 downto 0);
+    variable nextL     : unsigned(31 downto 0);
+    variable nextR     : unsigned(31 downto 0);
   begin
-    if falling_edge(i2s_tx_sclk) then
+    if falling_edge(i2s_rx_sclk) then
+      lrclk_rx_d <= i2s_rx_lrclk;
 
-      -- Start-of-slot: reload shift reg
-      if adc_bitcnt = 0 then
-        -- Visible patterns so you can spot bit shifts easily:
-        -- left  = 0xA0000000 + sample_id
-        -- right = 0x50000000 + sample_id
-        -- typed base patterns (avoid ambiguous x"..." conversions)
-        
-        -- inside the process where you build samples:
-        adc_left  <= std_logic_vector(ADC_LEFT_BASE  + resize(sample_id, 32));
-        adc_right <= std_logic_vector(ADC_RIGHT_BASE + resize(sample_id, 32));
-        
-        
-        if i2s_tx_lrclk = '0' then
-          adc_shift <= adc_left;
+      if i2s_rx_lrclk /= lrclk_rx_d then
+        -- LRCLK toggled => new slot starting
+        adc_phase <= 0;
+
+        -- FIX #4: compute new sample_id and new patterns NOW
+        next_id := sample_id + 1;
+        sample_id <= next_id;
+
+        nextL := ADC_LEFT_BASE  + next_id;
+        nextR := ADC_RIGHT_BASE + next_id;
+
+        adc_left  <= std_logic_vector(nextL);
+        adc_right <= std_logic_vector(nextR);
+
+        -- load adc_word from the UPDATED values immediately
+        if i2s_rx_lrclk = '0' then
+          adc_word <= std_logic_vector(nextL); -- left slot
         else
-          adc_shift <= adc_right;
-          sample_id := sample_id + 1; -- bump once per stereo frame
+          adc_word <= std_logic_vector(nextR); -- right slot
         end if;
 
-        adc_bitcnt <= SLOT_BITS;
-      end if;
-
-      -- I2S 1-bit delay: output dummy bit first after reload
-      if adc_bitcnt = SLOT_BITS then
+        -- delay bit (I2S offset)
         i2s_rx_sdata <= '0';
+
       else
-        i2s_rx_sdata <= adc_shift(SLOT_BITS-1); -- MSB first
-        adc_shift    <= adc_shift(SLOT_BITS-2 downto 0) & '0';
-      end if;
+        -- inside slot
+        if adc_phase < 32 then
+          adc_phase <= adc_phase + 1;
+        else
+          adc_phase <= 32;
+        end if;
 
-      if adc_bitcnt > 0 then
-        adc_bitcnt <= adc_bitcnt - 1;
+        if adc_phase = 0 then
+          i2s_rx_sdata <= '0'; -- delay bit
+        else
+          bit_index := 32 - adc_phase; -- phase1->31 ... phase32->0
+          i2s_rx_sdata <= adc_word(bit_index);
+        end if;
       end if;
-
     end if;
   end process;
 
   ----------------------------------------------------------------------
   -- DAC Decode Monitor: reconstruct from SDIN (i2s_tx_sdata)
-  --
-  -- We sample on rising edge, and we ignore the first bit after slot start
-  -- to match I2S 1-bit delay.
   ----------------------------------------------------------------------
   process(i2s_tx_sclk)
+    variable bit_index : integer;
   begin
     if rising_edge(i2s_tx_sclk) then
+      lrclk_d <= i2s_tx_lrclk;
 
-      if dac_bitcnt = 0 then
-        dac_bitcnt <= SLOT_BITS;
-      end if;
-
-      -- Ignore first bit after slot start (I2S delay)
-      if dac_bitcnt = SLOT_BITS then
-        null;
-      else
-        dac_shift <= dac_shift(SLOT_BITS-2 downto 0) & i2s_tx_sdata;
-      end if;
-
-      if dac_bitcnt > 0 then
-        dac_bitcnt <= dac_bitcnt - 1;
-      end if;
-
-      -- When finishing a slot, latch based on LRCLK
-      if dac_bitcnt = 1 then
-        if i2s_tx_lrclk = '0' then
-          dac_left <= dac_shift;
+      if i2s_tx_lrclk /= lrclk_d then
+        -- boundary: commit previous word
+        if i2s_tx_lrclk = '1' then
+          dac_left <= dac_word;
         else
-          dac_right <= dac_shift;
+          dac_right <= dac_word;
+        end if;
+
+        dac_word  <= (others => '0');
+        dac_phase <= 0;
+
+      else
+        if dac_phase < 32 then
+          dac_phase <= dac_phase + 1;
+        else
+          dac_phase <= 32;
+        end if;
+
+        if dac_phase /= 0 then
+          bit_index := 32 - dac_phase;
+          dac_word(bit_index) <= i2s_tx_sdata;
         end if;
       end if;
-
     end if;
   end process;
 
   ----------------------------------------------------------------------
-  -- Print once per right-channel boundary (LRCLK rising edge in our convention)
+  -- Print once per right-channel boundary (LRCLK rising edge)
   ----------------------------------------------------------------------
   process(i2s_tx_lrclk)
   begin
@@ -237,10 +255,8 @@ begin
 
 end architecture;
 
-
 --------------------------------------------------------------------------------
 -- ======================== BEHAVIORAL STUBS ==================================
--- These let the sim run without Xilinx IP libraries.
 --------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
@@ -278,9 +294,9 @@ begin
   end process;
 end architecture;
 
-
 --------------------------------------------------------------------------------
--- i2s_transmitter_0 stub (FIXED OUT-READ ISSUES)
+-- i2s_transmitter_0 stub
+-- FIX #2: phase-align clocking start by resetting counters on enable rising
 --------------------------------------------------------------------------------
 library ieee;
 use ieee.std_logic_1164.all;
@@ -331,21 +347,20 @@ entity i2s_transmitter_0 is
 end entity;
 
 architecture beh of i2s_transmitter_0 is
-  signal div_reg  : unsigned(7 downto 0) := to_unsigned(2,8); -- default for your 96k setup
+  signal div_reg  : unsigned(7 downto 0) := to_unsigned(2,8);
   signal en_reg   : std_logic := '0';
+  signal en_d     : std_logic := '0';  -- detect rising edge of enable
 
   signal sclk_i   : std_logic := '0';
   signal lrclk_i  : std_logic := '0';
   signal mclk_cnt : unsigned(7 downto 0) := (others => '0');
 
-  -- internal bvalid so we can read it
   signal bvalid_r : std_logic := '0';
 
   signal bitcnt    : integer range 0 to 31 := 0;
   signal shifter   : std_logic_vector(31 downto 0) := (others => '0');
   signal have_word : std_logic := '0';
 begin
-  -- Tie-offs
   s_axi_ctrl_arready <= '1';
   s_axi_ctrl_rvalid  <= '0';
   s_axi_ctrl_rdata   <= (others => '0');
@@ -353,11 +368,10 @@ begin
   irq                <= '0';
   sdata_1_out        <= '0';
 
-  -- drive output bvalid from internal reg
   s_axi_ctrl_bvalid <= bvalid_r;
   s_axi_ctrl_bresp  <= "00";
 
-  -- AXI-lite write (simplified)
+  -- AXI-lite write (simple)
   process(s_axi_ctrl_aclk)
   begin
     if rising_edge(s_axi_ctrl_aclk) then
@@ -387,31 +401,44 @@ begin
     end if;
   end process;
 
-  -- SCLK generation: toggle every div_reg MCLK cycles => MCLK/SCLK = 2*div_reg
+  -- SCLK generation: phase-align on enable rising
   process(aud_mclk)
   begin
     if rising_edge(aud_mclk) then
       if aud_mrst = '1' then
+        en_d     <= '0';
         mclk_cnt <= (others => '0');
         sclk_i   <= '0';
-      elsif en_reg = '1' then
-        if mclk_cnt = div_reg-1 then
+      else
+        en_d <= en_reg;
+
+        -- FIX #2: reset phase when enable rises
+        if (en_reg = '1' and en_d = '0') then
           mclk_cnt <= (others => '0');
-          sclk_i   <= not sclk_i;
-        else
-          mclk_cnt <= mclk_cnt + 1;
+          sclk_i   <= '0';
+        elsif en_reg = '1' then
+          if mclk_cnt = div_reg-1 then
+            mclk_cnt <= (others => '0');
+            sclk_i   <= not sclk_i;
+          else
+            mclk_cnt <= mclk_cnt + 1;
+          end if;
         end if;
       end if;
     end if;
   end process;
   sclk_out <= sclk_i;
 
-  -- LRCLK generation: toggle every 32 SCLK rising edges (32-bit slots)
+  -- LRCLK generation: toggle every 32 SCLK rising edges
   process(sclk_i)
     variable half_cnt : integer range 0 to 31 := 0;
   begin
     if rising_edge(sclk_i) then
       if aud_mrst = '1' then
+        lrclk_i  <= '0';
+        half_cnt := 0;
+      elsif (en_reg = '1' and en_d = '0') then
+        -- FIX #2: phase-align LRCLK too
         lrclk_i  <= '0';
         half_cnt := 0;
       elsif en_reg = '1' then
@@ -426,10 +453,10 @@ begin
   end process;
   lrclk_out <= lrclk_i;
 
-  -- AXIS ready when enabled
   s_axis_aud_tready <= en_reg;
 
-  -- Serialize with 1-bit I2S delay; change data on falling edge
+  -- Serialize (simple + consistent with your TB)
+  -- change data on falling edge
   process(sclk_i)
   begin
     if falling_edge(sclk_i) then
@@ -446,9 +473,8 @@ begin
           else
             have_word <= '0';
           end if;
-
           bitcnt      <= 31;
-          sdata_0_out <= '0'; -- dummy bit (I2S delay)
+          sdata_0_out <= '0'; -- delay bit (model)
         else
           if have_word = '1' then
             sdata_0_out <= shifter(31);
@@ -464,9 +490,10 @@ begin
 
 end architecture;
 
-
 --------------------------------------------------------------------------------
--- i2s_receiver_inputs stub (FIXED OUT-READ ISSUES)
+-- i2s_receiver_inputs stub
+-- FIX #2: phase-align on enable rising
+-- FIX #3: last bit captured correctly
 --------------------------------------------------------------------------------
 library ieee;
 use ieee.std_logic_1164.all;
@@ -519,12 +546,12 @@ end entity;
 architecture beh of i2s_receiver_inputs is
   signal div_reg  : unsigned(7 downto 0) := to_unsigned(2,8);
   signal en_reg   : std_logic := '0';
+  signal en_d     : std_logic := '0';  -- detect rising edge
 
   signal sclk_i   : std_logic := '0';
   signal lrclk_i  : std_logic := '0';
   signal mclk_cnt : unsigned(7 downto 0) := (others => '0');
 
-  -- internal bvalid / tvalid so we can read them
   signal bvalid_r : std_logic := '0';
   signal tvalid_r : std_logic := '0';
 
@@ -532,7 +559,6 @@ architecture beh of i2s_receiver_inputs is
   signal shifter  : std_logic_vector(31 downto 0) := (others => '0');
   signal skip1    : std_logic := '1';
 begin
-  -- Tie-offs
   s_axi_ctrl_arready <= '1';
   s_axi_ctrl_rvalid  <= '0';
   s_axi_ctrl_rdata   <= (others => '0');
@@ -540,7 +566,6 @@ begin
   irq                <= '0';
   m_axis_aud_tid     <= (others => '0');
 
-  -- outputs driven from internal regs
   s_axi_ctrl_bvalid  <= bvalid_r;
   s_axi_ctrl_bresp   <= "00";
   m_axis_aud_tvalid  <= tvalid_r;
@@ -575,31 +600,42 @@ begin
     end if;
   end process;
 
-  -- SCLK gen
+  -- SCLK gen: phase-align on enable rising (FIX #2)
   process(aud_mclk)
   begin
     if rising_edge(aud_mclk) then
       if aud_mrst = '1' then
+        en_d     <= '0';
         mclk_cnt <= (others => '0');
         sclk_i   <= '0';
-      elsif en_reg = '1' then
-        if mclk_cnt = div_reg-1 then
+      else
+        en_d <= en_reg;
+
+        if (en_reg = '1' and en_d = '0') then
           mclk_cnt <= (others => '0');
-          sclk_i   <= not sclk_i;
-        else
-          mclk_cnt <= mclk_cnt + 1;
+          sclk_i   <= '0';
+        elsif en_reg = '1' then
+          if mclk_cnt = div_reg-1 then
+            mclk_cnt <= (others => '0');
+            sclk_i   <= not sclk_i;
+          else
+            mclk_cnt <= mclk_cnt + 1;
+          end if;
         end if;
       end if;
     end if;
   end process;
   sclk_out <= sclk_i;
 
-  -- LRCLK gen (32-bit slots)
+  -- LRCLK gen: phase-align on enable rising (FIX #2)
   process(sclk_i)
     variable half_cnt : integer range 0 to 31 := 0;
   begin
     if rising_edge(sclk_i) then
       if aud_mrst = '1' then
+        lrclk_i  <= '0';
+        half_cnt := 0;
+      elsif (en_reg = '1' and en_d = '0') then
         lrclk_i  <= '0';
         half_cnt := 0;
       elsif en_reg = '1' then
@@ -614,8 +650,10 @@ begin
   end process;
   lrclk_out <= lrclk_i;
 
-  -- Deserialize on rising edge; skip first bit after boundary (I2S delay)
+  -- Deserialize on rising edge; skip first bit after boundary (I2S delay model)
+  -- FIX #3: capture last bit correctly using a "next" variable
   process(sclk_i)
+    variable sh_next : std_logic_vector(31 downto 0);
   begin
     if rising_edge(sclk_i) then
       if aud_mrst = '1' then
@@ -623,23 +661,33 @@ begin
         shifter   <= (others => '0');
         tvalid_r  <= '0';
         skip1     <= '1';
+        m_axis_aud_tdata <= (others => '0');
       elsif en_reg = '1' then
+
+        -- default
+        sh_next := shifter;
+
         if bitcnt = 0 then
           bitcnt   <= 31;
           skip1    <= '1';
           tvalid_r <= '0';
+          sh_next  := (others => '0');
         else
           if skip1 = '1' then
             skip1 <= '0'; -- ignore first bit
           else
-            shifter <= shifter(30 downto 0) & sdata_0_in;
+            sh_next := shifter(30 downto 0) & sdata_0_in;
           end if;
+
           bitcnt <= bitcnt - 1;
         end if;
 
-        -- present word at end of slot
+        -- commit shifter update
+        shifter <= sh_next;
+
+        -- end-of-slot: use sh_next so we don't drop the last captured bit
         if bitcnt = 1 then
-          m_axis_aud_tdata <= shifter;
+          m_axis_aud_tdata <= sh_next;
           tvalid_r         <= '1';
         elsif (tvalid_r = '1' and m_axis_aud_tready = '1') then
           tvalid_r <= '0';
