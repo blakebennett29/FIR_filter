@@ -207,40 +207,60 @@ begin
     end if;
   end process;
 
-  ----------------------------------------------------------------------
-  -- DAC Decode Monitor: reconstruct from SDIN (i2s_tx_sdata)
-  ----------------------------------------------------------------------
-  process(i2s_tx_sclk)
-    variable bit_index : integer;
-  begin
-    if rising_edge(i2s_tx_sclk) then
-      lrclk_d <= i2s_tx_lrclk;
+----------------------------------------------------------------------
+-- DAC Decode Monitor (ROBUST I2S):
+-- - LRCLK toggles at slot boundary
+-- - 1-bit I2S delay: ignore the FIRST rising edge after LRCLK change
+-- - Then capture 32 rising-edge samples as bits 31..0
+-- - Commit the word that ended based on PREVIOUS LRCLK level
+----------------------------------------------------------------------
+process(i2s_tx_sclk)
+  variable prev_lr   : std_logic := '0';
+  variable phase     : integer range 0 to 33 := 0;
+  -- phase meanings:
+  --   0  = "need to skip dummy sample next"
+  --   1..32 = capturing real bits (bit31..bit0)
+  --   33 = done (waiting for next LRCLK edge)
+  variable idx       : integer;
+begin
+  if rising_edge(i2s_tx_sclk) then
 
-      if i2s_tx_lrclk /= lrclk_d then
-        -- boundary: commit previous word
-        if i2s_tx_lrclk = '1' then
-          dac_left <= dac_word;
-        else
-          dac_right <= dac_word;
-        end if;
+    -- Detect LRCLK edge using a *variable* previous value (no delta-cycle weirdness)
+    if i2s_tx_lrclk /= prev_lr then
+      -- Slot boundary hit: commit the word that just finished.
+      -- The slot that just finished had LRCLK = prev_lr.
+      if prev_lr = '0' then
+        dac_left <= dac_word;   -- finished LEFT slot
+      else
+        dac_right <= dac_word;  -- finished RIGHT slot
+      end if;
 
-        dac_word  <= (others => '0');
-        dac_phase <= 0;
+      -- Start new word capture
+      dac_word <= (others => '0');
+      phase    := 0;            -- next rising edge is dummy-bit sample (skip it)
+      prev_lr  := i2s_tx_lrclk; -- update prev_lr to new slot level
+
+    else
+      -- Inside a slot
+      if phase = 0 then
+        -- This rising edge samples the I2S dummy bit -> ignore it
+        phase := 1;
+
+      elsif (phase >= 1) and (phase <= 32) then
+        -- Capture 32 real bits: phase 1->bit31 ... phase 32->bit0
+        idx := 32 - phase;              -- phase=1 -> 31, phase=32 -> 0
+        dac_word(idx) <= i2s_tx_sdata;  -- sample on rising edge
+        phase := phase + 1;
 
       else
-        if dac_phase < 32 then
-          dac_phase <= dac_phase + 1;
-        else
-          dac_phase <= 32;
-        end if;
-
-        if dac_phase /= 0 then
-          bit_index := 32 - dac_phase;
-          dac_word(bit_index) <= i2s_tx_sdata;
-        end if;
+        -- phase = 33: already captured full word, wait for LRCLK edge
+        phase := 33;
       end if;
     end if;
-  end process;
+  end if;
+end process;
+
+
 
   ----------------------------------------------------------------------
   -- Print once per right-channel boundary (LRCLK rising edge)
