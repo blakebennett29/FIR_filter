@@ -287,8 +287,8 @@ begin
     --------------------------------------------------------------------
     i2s_tx_lrclk <= bus_lrclk; -- Pmod pin2
     i2s_tx_sclk  <= bus_sclk;  -- Pmod pin3
-    i2s_rx_lrclk <= bus_lrclk; -- Pmod pin8
-    i2s_rx_sclk  <= bus_sclk;  -- Pmod pin9
+    --i2s_rx_lrclk <= bus_lrclk; -- Pmod pin8
+    --i2s_rx_sclk  <= bus_sclk;  -- Pmod pin9
 
    ------------------------------------------------------------------------------
 -- TX AXI-Lite init FSM
@@ -565,8 +565,8 @@ end process;
 
             irq                => open,
 
-            lrclk_out          => open,
-            sclk_out           => open,
+            lrclk_out          => i2s_rx_lrclk, -- was open used lr clk for simulation  On the real board you want shared clocks; for simulation with these stubs, you need the ADC model synchronized to the RX stub's clock domain.
+            sclk_out           => i2s_rx_sclk, -- same was open used for simulation
             sdata_0_in         => i2s_rx_sdata, -- ADC SDOUT from Pmod pin10
             sdata_1_in         => '0',
 
